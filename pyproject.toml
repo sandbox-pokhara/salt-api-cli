@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=70.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "salt-cli"
+requires-python = ">=3.11"
+authors = [{ name = "Pradish Bijukchhe", email = "pradish@sandbox.com.np" }]
+description = "CLI to access salt-api"
+readme = "README.md"
+license = "MIT"
+keywords = []
+classifiers = ["Programming Language :: Python :: 3"]
+dependencies = []
+dynamic = ["version"]
+
+[project.optional-dependencies]
+pre-commit = ["pre-commit"]
+
+[project.urls]
+Homepage = "https://github.com/sandbox-pokhara/salt-cli"
+Issues = "https://github.com/sandbox-pokhara/salt-cli/issues"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-dir]
+"salt_cli" = "salt_cli"
+
+[tool.setuptools.dynamic]
+version = { attr = "salt_cli.version.__version__" }
+
+[tool.ruff.lint]
+select = ["I"]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+include = ["salt_cli", "test.py"]
+typeCheckingMode = "strict"

@@ -1,11 +1,11 @@
-"""salt-cli — thin Python CLI for salt-api.
+"""salt-api-cli — thin Python CLI for salt-api.
 
 Stdlib-only. Logs in once with PAM creds, caches the token in
-~/.cache/salt-cli/token.json, then invokes the salt-api local/runner/
-wheel clients over HTTPS. Token auto-refreshes when expired.
+~/.cache/salt-api-cli/token.json, then invokes the salt-api local/
+runner/wheel clients over HTTPS. Token auto-refreshes when expired.
 
 Configuration (later sources override earlier):
-    1. ~/.saltclirc                       INI file, [salt-cli] section
+    1. ~/.saltapiclirc                    INI file, [salt-api-cli] section
     2. environment variables              SALT_API_URL, SALT_API_USER,
                                           SALT_API_PASS, SALT_API_INSECURE
     3. command-line flags                 --url, --user, --password,
@@ -31,10 +31,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-CONFIG_FILE = Path.home() / ".saltclirc"
-CONFIG_SECTION = "salt-cli"
-TOKEN_FILE = Path.home() / ".cache" / "salt-cli" / "token.json"
-USER_AGENT = "salt-cli/1.0 (Mozilla/5.0 compatible)"
+CONFIG_FILE = Path.home() / ".saltapiclirc"
+CONFIG_SECTION = "salt-api-cli"
+TOKEN_FILE = Path.home() / ".cache" / "salt-api-cli" / "token.json"
+USER_AGENT = "salt-api-cli/1.0 (Mozilla/5.0 compatible)"
 
 # Wheel key.list_all groups minion IDs by acceptance state under these keys.
 KEY_STATUS_LABELS = {
@@ -84,12 +84,12 @@ def _load_config(args: argparse.Namespace) -> Config:
 
     if not url:
         sys.exit(
-            "salt-api URL not set (use --url, SALT_API_URL, or url= in ~/.saltclirc)"
+            "salt-api URL not set (use --url, SALT_API_URL, or url= in ~/.saltapiclirc)"
         )
     if not password:
         sys.exit(
             "salt-api password not set "
-            "(use --password, SALT_API_PASS, or password= in ~/.saltclirc)"
+            "(use --password, SALT_API_PASS, or password= in ~/.saltapiclirc)"
         )
     return Config(
         url=url.rstrip("/"),
@@ -254,19 +254,19 @@ def _run_keys(cfg: Config, args: argparse.Namespace) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="salt-cli",
+        prog="salt-api-cli",
         description="Thin Python CLI for salt-api.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
-            "  salt-cli local '*' test.ping\n"
-            "  salt-cli local 'bml*' cmd.run 'whoami'\n"
-            "  salt-cli local 'bml1' cmd.run 'Get-Date' shell=powershell\n"
-            "  salt-cli runner manage.status\n"
-            "  salt-cli wheel key.list_all\n"
-            "  salt-cli keys list\n"
-            "  salt-cli keys accept '<id-or-glob>'\n"
-            "  salt-cli keys accept-all\n"
+            "  salt-api-cli local '*' test.ping\n"
+            "  salt-api-cli local 'bml*' cmd.run 'whoami'\n"
+            "  salt-api-cli local 'bml1' cmd.run 'Get-Date' shell=powershell\n"
+            "  salt-api-cli runner manage.status\n"
+            "  salt-api-cli wheel key.list_all\n"
+            "  salt-api-cli keys list\n"
+            "  salt-api-cli keys accept '<id-or-glob>'\n"
+            "  salt-api-cli keys accept-all\n"
         ),
     )
     parser.add_argument("--url", help="salt-api base URL")

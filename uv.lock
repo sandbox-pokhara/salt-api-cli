@@ -108,7 +108,7 @@ wheels = [
 ]
 
 [[package]]
-name = "salt-cli"
+name = "salt-api-cli"
 source = { editable = "." }
 
 [package.optional-dependencies]

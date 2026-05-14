@@ -3,7 +3,7 @@ requires = ["setuptools>=70.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "salt-cli"
+name = "salt-api-cli"
 requires-python = ">=3.11"
 authors = [{ name = "Pradish Bijukchhe", email = "pradish@sandbox.com.np" }]
 description = "CLI to access salt-api"
@@ -18,20 +18,20 @@ dynamic = ["version"]
 pre-commit = ["pre-commit"]
 
 [project.scripts]
-salt-cli = "salt_cli.cli:main"
+salt-api-cli = "salt_api_cli.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/sandbox-pokhara/salt-cli"
-Issues = "https://github.com/sandbox-pokhara/salt-cli/issues"
+Homepage = "https://github.com/sandbox-pokhara/saltapi-cli"
+Issues = "https://github.com/sandbox-pokhara/saltapi-cli/issues"
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.package-dir]
-"salt_cli" = "salt_cli"
+"salt_api_cli" = "salt_api_cli"
 
 [tool.setuptools.dynamic]
-version = { attr = "salt_cli.version.__version__" }
+version = { attr = "salt_api_cli.version.__version__" }
 
 [tool.ruff.lint]
 select = ["I"]
@@ -39,5 +39,5 @@ select = ["I"]
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
-include = ["salt_cli"]
+include = ["salt_api_cli"]
 typeCheckingMode = "strict"

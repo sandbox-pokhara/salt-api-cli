@@ -17,6 +17,9 @@ dynamic = ["version"]
 [project.optional-dependencies]
 pre-commit = ["pre-commit"]
 
+[project.scripts]
+salt-cli = "salt_cli.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/sandbox-pokhara/salt-cli"
 Issues = "https://github.com/sandbox-pokhara/salt-cli/issues"
@@ -36,5 +39,5 @@ select = ["I"]
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
-include = ["salt_cli", "test.py"]
+include = ["salt_cli"]
 typeCheckingMode = "strict"

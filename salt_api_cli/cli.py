@@ -82,6 +82,7 @@ class AuthError(SaltApiError):
     attempted.
     """
 
+
 # Wheel key.list_all groups minion IDs by acceptance state under these keys.
 KEY_STATUS_LABELS = {
     "minions": "Accepted",
@@ -384,19 +385,19 @@ def _run_keys(cfg: Config, args: argparse.Namespace) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="salt-api-cli",
+        prog="salt",
         description="Thin Python CLI for salt-api.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
-            "  salt-api-cli local '*' test.ping\n"
-            "  salt-api-cli local 'bml*' cmd.run 'whoami'\n"
-            "  salt-api-cli local 'bml1' cmd.run 'Get-Date' shell=powershell\n"
-            "  salt-api-cli runner manage.status\n"
-            "  salt-api-cli wheel key.list_all\n"
-            "  salt-api-cli keys list\n"
-            "  salt-api-cli keys accept '<id-or-glob>'\n"
-            "  salt-api-cli keys accept-all\n"
+            "  salt local '*' test.ping\n"
+            "  salt local 'bml*' cmd.run 'whoami'\n"
+            "  salt local 'bml1' cmd.run 'Get-Date' shell=powershell\n"
+            "  salt runner manage.status\n"
+            "  salt wheel key.list_all\n"
+            "  salt keys list\n"
+            "  salt keys accept '<id-or-glob>'\n"
+            "  salt keys accept-all\n"
         ),
     )
     parser.add_argument("--url", help="salt-api base URL")

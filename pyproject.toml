@@ -20,7 +20,7 @@ dynamic = ["version"]
 pre-commit = ["pre-commit"]
 
 [project.scripts]
-salt-api-cli = "salt_api_cli.cli:main"
+salt = "salt_api_cli.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/sandbox-pokhara/saltapi-cli"

@@ -38,23 +38,23 @@ certificate verification.
 
 ```
 # Local client — fan out to minions
-salt-api-cli local '*' test.ping
-salt-api-cli local 'bml*' cmd.run 'whoami'
-salt-api-cli local 'bml1' cmd.run 'Get-Date' shell=powershell
+salt local '*' test.ping
+salt local 'bml*' cmd.run 'whoami'
+salt local 'bml1' cmd.run 'Get-Date' shell=powershell
 
 # Runner client (master-side: manage.status, jobs.list_jobs, ...)
-salt-api-cli runner manage.status
-salt-api-cli runner jobs.list_jobs
+salt runner manage.status
+salt runner jobs.list_jobs
 
 # Wheel client (master-side, low-level)
-salt-api-cli wheel key.list_all
+salt wheel key.list_all
 
 # Key management (high-level wrapper around the wheel client)
-salt-api-cli keys list
-salt-api-cli keys accept <id-or-glob>
-salt-api-cli keys accept-all
-salt-api-cli keys reject <id-or-glob>
-salt-api-cli keys delete <id-or-glob>
+salt keys list
+salt keys accept <id-or-glob>
+salt keys accept-all
+salt keys reject <id-or-glob>
+salt keys delete <id-or-glob>
 ```
 
 Any `key=value` argument is parsed as a kwarg to the salt function;

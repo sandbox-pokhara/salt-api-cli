@@ -62,10 +62,10 @@ def _run_client(cfg: Config, client: str, args: argparse.Namespace) -> None:
 
 
 def _run_state(cfg: Config, args: argparse.Namespace) -> None:
-    def local(**kw: Any) -> dict[str, Any]:
-        return call(cfg, "local", **kw)
+    def client(name: str, **kw: Any) -> dict[str, Any]:
+        return call(cfg, name, **kw)
 
-    highlevel.run_state(args, local)
+    highlevel.run_state(args, client)
 
 
 def _run_keys(cfg: Config, args: argparse.Namespace) -> None:

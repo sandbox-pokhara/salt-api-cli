@@ -12,6 +12,7 @@ license = "MIT"
 keywords = []
 classifiers = ["Programming Language :: Python :: 3"]
 dependencies = [
+    "rich>=15.0.0",
     "typeguard>=4.5.2",
 ]
 dynamic = ["version"]

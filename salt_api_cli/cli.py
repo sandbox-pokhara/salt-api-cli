@@ -1,15 +1,25 @@
 """salt-api-cli — thin Python CLI for salt-api.
 
-Stdlib-only. Logs in once with PAM creds, caches the token in
+Logs in once with PAM creds, caches the token in
 ~/.cache/salt-api-cli/token.json, then invokes the salt-api local/
-runner/wheel clients over HTTPS. Token auto-refreshes when expired.
+runner/wheel clients over HTTPS. Depends only on the stdlib plus
+``typeguard`` for validating cached/responded JSON.
+
+The cached token self-heals: it is refreshed proactively when its stored
+expiry has passed, and reactively when the server rejects it (HTTP 401 or
+an EAUTH body) — e.g. after the salt-master container restarts and wipes
+its session store. On rejection the CLI discards the token, logs in again,
+and retries the request once before giving up. `--relogin` forces a fresh
+login, `--no-token-cache` skips the cache entirely, and the `logout`
+subcommand discards the cached token.
 
 Configuration (later sources override earlier):
     1. ~/.saltapiclirc                    INI file, [salt-api-cli] section
     2. environment variables              SALT_API_URL, SALT_API_USER,
                                           SALT_API_PASS, SALT_API_INSECURE
     3. command-line flags                 --url, --user, --password,
-                                          --insecure
+                                          --insecure, --relogin,
+                                          --no-token-cache
 
 Any `key=value` argument to local/runner/wheel is parsed as a kwarg to
 the salt function. Anything else is positional.
@@ -31,10 +41,46 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from typeguard import TypeCheckError, check_type
+
 CONFIG_FILE = Path.home() / ".saltapiclirc"
 CONFIG_SECTION = "salt-api-cli"
 TOKEN_FILE = Path.home() / ".cache" / "salt-api-cli" / "token.json"
 USER_AGENT = "salt-api-cli/1.0 (Mozilla/5.0 compatible)"
+
+# Treat a cached token as already gone this many seconds before its real
+# expiry, so we never send one that lapses mid-flight.
+TOKEN_EXPIRY_MARGIN = 60
+
+# Substrings that mark a salt-api JSON body as an auth failure. salt-api
+# usually answers an invalid token with HTTP 401, but it sometimes returns
+# 200 with one of these in the payload instead.
+_AUTH_FAIL_MARKERS = (
+    "eauth",
+    "no permission",
+    "not authorized",
+    "authentication denied",
+    "failed to authenticate",
+)
+
+_AUTH_FAIL_HINT = (
+    "salt-api authentication still failed after a fresh login — the "
+    "credentials may be wrong or the user lacks permission "
+    "(check --user/--password, SALT_API_USER/SALT_API_PASS, or "
+    "~/.saltapiclirc)."
+)
+
+
+class SaltApiError(Exception):
+    """A salt-api error whose message is safe to show the user verbatim."""
+
+
+class AuthError(SaltApiError):
+    """An authentication failure (HTTP 401 or an EAUTH/auth-failure body).
+
+    Signals that the token in hand was rejected and a re-login should be
+    attempted.
+    """
 
 # Wheel key.list_all groups minion IDs by acceptance state under these keys.
 KEY_STATUS_LABELS = {
@@ -51,6 +97,10 @@ class Config:
     user: str
     password: str
     insecure: bool
+    # Ignore any cached token and log in fresh (the new token is still cached).
+    relogin: bool = False
+    # Neither read nor write the token cache for this run.
+    no_token_cache: bool = False
 
 
 def _truthy(value: str) -> bool:
@@ -96,6 +146,8 @@ def _load_config(args: argparse.Namespace) -> Config:
         user=user,
         password=password,
         insecure=insecure,
+        relogin=bool(getattr(args, "relogin", False)),
+        no_token_cache=bool(getattr(args, "no_token_cache", False)),
     )
 
 
@@ -115,9 +167,25 @@ def _http(req: Request, cfg: Config) -> dict[str, Any]:
             return data
     except HTTPError as e:
         body = e.read().decode(errors="replace")
-        sys.exit(f"salt-api {e.code} {e.reason}: {body}")
+        if e.code == 401:
+            raise AuthError(f"salt-api 401 {e.reason}: {body}") from e
+        raise SaltApiError(f"salt-api {e.code} {e.reason}: {body}") from e
     except URLError as e:
-        sys.exit(f"salt-api unreachable: {e.reason}")
+        raise SaltApiError(f"salt-api unreachable: {e.reason}") from e
+
+
+def _is_auth_failure(result: dict[str, Any]) -> bool:
+    """True if a 200 response body is actually an EAUTH/auth-failure notice."""
+    texts: list[str] = []
+    try:
+        texts.extend(check_type(result.get("return"), list[str]))
+    except TypeCheckError:
+        pass  # a normal result ("return" is a list of dicts) — not an auth body
+    for key in ("error", "status"):
+        val = result.get(key)
+        if isinstance(val, str):
+            texts.append(val)
+    return any(m in t.lower() for t in texts for m in _AUTH_FAIL_MARKERS)
 
 
 def _login(cfg: Config) -> dict[str, Any]:
@@ -136,37 +204,99 @@ def _login(cfg: Config) -> dict[str, Any]:
     return info
 
 
-def _get_token(cfg: Config) -> str:
-    if TOKEN_FILE.exists():
-        try:
-            cached: dict[str, Any] = json.loads(TOKEN_FILE.read_text())
-            if cached.get("expire", 0) > time.time() + 60:
-                return str(cached["token"])
-        except (json.JSONDecodeError, OSError, AttributeError, TypeError):
-            pass
-    info = _login(cfg)
-    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TOKEN_FILE.write_text(json.dumps(info))
+def _read_cached_token(cfg: Config) -> str | None:
+    """Return a still-valid cached token, or None to force a fresh login.
+
+    Tolerant of a missing, empty, corrupt, or schema-mismatched token.json:
+    any problem reading it is treated as "no usable token". A token whose
+    `expire` is in the past (within a safety margin) is also discarded.
+    """
+    if cfg.relogin or cfg.no_token_cache:
+        return None
     try:
-        os.chmod(TOKEN_FILE, 0o600)
+        raw = TOKEN_FILE.read_text()
+    except OSError:
+        return None
+    try:
+        cached = check_type(json.loads(raw), dict[str, Any])
+    except (json.JSONDecodeError, ValueError, TypeCheckError):
+        return None
+    token = cached.get("token")
+    if not token:
+        return None
+    try:
+        expire = float(cached.get("expire", 0))
+    except (TypeError, ValueError):
+        return None
+    if expire <= time.time() + TOKEN_EXPIRY_MARGIN:
+        return None
+    return str(token)
+
+
+def _clear_token() -> None:
+    """Discard the cached token, if any. Never raises."""
+    try:
+        TOKEN_FILE.unlink()
     except OSError:
         pass
+
+
+def _fresh_token(cfg: Config) -> str:
+    """Log in and (unless caching is disabled) persist the new token."""
+    info = _login(cfg)
+    if not cfg.no_token_cache:
+        try:
+            TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+            TOKEN_FILE.write_text(json.dumps(info))
+            os.chmod(TOKEN_FILE, 0o600)
+        except OSError:
+            pass
     return str(info["token"])
+
+
+def _get_token(cfg: Config) -> str:
+    cached = _read_cached_token(cfg)
+    if cached is not None:
+        return cached
+    return _fresh_token(cfg)
 
 
 def _call(cfg: Config, client: str, **kwargs: Any) -> dict[str, Any]:
     payload = [{"client": client, **kwargs}]
-    req = Request(
-        cfg.url,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "X-Auth-Token": _get_token(cfg),
-            "User-Agent": USER_AGENT,
-        },
-    )
-    return _http(req, cfg)
+    body = json.dumps(payload).encode()
+
+    def attempt(token: str) -> dict[str, Any]:
+        req = Request(
+            cfg.url,
+            data=body,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "X-Auth-Token": token,
+                "User-Agent": USER_AGENT,
+            },
+        )
+        return _http(req, cfg)
+
+    # First try with whatever token we have (cached or freshly minted). A
+    # rejected token here means it went stale server-side (expiry, or the
+    # salt-master session store was wiped on restart) — not bad credentials.
+    try:
+        result = attempt(_get_token(cfg))
+        if not _is_auth_failure(result):
+            return result
+    except AuthError:
+        pass
+
+    # Discard the stale token, log in fresh, and retry exactly once.
+    _clear_token()
+    try:
+        result = attempt(_fresh_token(cfg))
+    except AuthError as e:
+        raise AuthError(f"{_AUTH_FAIL_HINT}\ndetails: {e}") from e
+    if _is_auth_failure(result):
+        raise AuthError(_AUTH_FAIL_HINT)
+    return result
 
 
 def _split_args(args: list[str]) -> tuple[list[str], dict[str, str]]:
@@ -277,6 +407,17 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip TLS certificate verification",
     )
+    parser.add_argument(
+        "--relogin",
+        action="store_true",
+        help="ignore any cached token and log in fresh (re-caches the new token)",
+    )
+    parser.add_argument(
+        "--no-token-cache",
+        dest="no_token_cache",
+        action="store_true",
+        help="do not read or write the token cache for this run",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -306,22 +447,39 @@ def _build_parser() -> argparse.ArgumentParser:
     p_delete = keys_sub.add_parser("delete", help="delete a key by id or glob")
     p_delete.add_argument("match")
 
+    sub.add_parser("logout", help="discard the cached auth token")
+
     return parser
 
 
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
+
+    # logout needs no server config — it just drops the local token file.
+    if args.command == "logout":
+        existed = TOKEN_FILE.exists()
+        _clear_token()
+        print(
+            f"discarded cached token ({TOKEN_FILE})"
+            if existed
+            else f"no cached token to discard ({TOKEN_FILE})"
+        )
+        return
+
     cfg = _load_config(args)
 
-    if args.command == "local":
-        _run_local(cfg, args)
-    elif args.command == "runner":
-        _run_client(cfg, "runner", args)
-    elif args.command == "wheel":
-        _run_client(cfg, "wheel", args)
-    elif args.command == "keys":
-        _run_keys(cfg, args)
+    try:
+        if args.command == "local":
+            _run_local(cfg, args)
+        elif args.command == "runner":
+            _run_client(cfg, "runner", args)
+        elif args.command == "wheel":
+            _run_client(cfg, "wheel", args)
+        elif args.command == "keys":
+            _run_keys(cfg, args)
+    except SaltApiError as e:
+        sys.exit(str(e))
 
 
 if __name__ == "__main__":

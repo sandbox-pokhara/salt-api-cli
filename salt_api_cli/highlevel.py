@@ -41,7 +41,7 @@ from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
-from salt_api_cli.lowlevel import SaltApiError, split_args
+from salt_api_cli.lowlevel import split_args
 
 console = Console()
 
@@ -249,27 +249,16 @@ def _print_state_result(result: dict[str, Any]) -> None:
 # How often to poll jobs.lookup_jid, and how long to keep waiting overall
 # before giving up on minions that never reported. Each poll is a fast,
 # self-contained request, so the proxy/gateway connection cap never bites.
+#
+# We don't probe minion liveness (saltutil.find_job): an empty probe is
+# ambiguous — a busy-but-alive Windows minion mid-highstate can simply fail to
+# answer in time and look identical to a down one, so probing wrongly dropped
+# live minions. Instead we just poll until every targeted minion has returned
+# or _POLL_DEADLINE trips, then render whatever came back. The job keeps
+# running on the minions regardless; results stay fetchable later by jid. Press
+# Ctrl+C to stop waiting early and render the partial results gathered so far.
 _POLL_INTERVAL = 3.0
 _POLL_DEADLINE = 1800.0  # 30 minutes (hard backstop)
-
-# Once this many seconds pass with no new minion reporting, probe the
-# still-outstanding minions with saltutil.find_job to tell "still running"
-# apart from "down / lost the job" — the latter are dropped so we stop
-# waiting on them.
-#
-# The probe passes BOTH a short publish ``timeout`` and a short
-# ``gather_job_timeout``. The latter matters most: when a call targets an
-# offline minion, the master runs its own internal find_job and waits
-# gather_job_timeout (default ~10s on the master) for a reply that never
-# comes — so without overriding it, flagging an offline minion costs ~10s+
-# no matter how small ``timeout`` is. With both set low the cost drops to a
-# few seconds (verified against this master: offline minion flagged in ~3s).
-# find_job reports whether a minion is *running the job*, so an online minion
-# answers within ``timeout`` and is never wrongly dropped. Instant detection
-# would need presence_events on the master (manage.present/alived are empty).
-_GATHER_TIMEOUT = 5.0
-_FIND_JOB_TIMEOUT = 2.0
-_FIND_JOB_GATHER = 2.0
 
 
 def _first_return(resp: dict[str, Any]) -> Any:
@@ -278,38 +267,6 @@ def _first_return(resp: dict[str, Any]) -> Any:
     if isinstance(ret, list) and ret:
         return cast("Any", ret[0])
     return {}
-
-
-def _find_dead(
-    call: Callable[..., dict[str, Any]], jid: str, candidates: set[str]
-) -> set[str]:
-    """Return the candidates that are NOT running ``jid`` (down or lost it).
-
-    Probes only ``candidates`` via the local client + ``saltutil.find_job``
-    with a short timeout. A minion actively running the job answers with a
-    non-empty dict naming the jid; one that's down never answers, and one
-    that's up but no longer running it answers empty — both mean it won't
-    return, so it's reported dead. A failed probe reports nobody dead (we'd
-    rather wait than wrongly drop a live minion)."""
-    if not candidates:
-        return set()
-    try:
-        resp = call(
-            "local",
-            tgt=sorted(candidates),
-            tgt_type="list",
-            fun="saltutil.find_job",
-            arg=[jid],
-            timeout=_FIND_JOB_TIMEOUT,
-            gather_job_timeout=_FIND_JOB_GATHER,
-        )
-    except SaltApiError:
-        return set()
-    ret = _first_return(resp)
-    if not isinstance(ret, dict):
-        return set()
-    running = cast("dict[str, Any]", ret)
-    return {m for m in candidates if not running.get(m)}
 
 
 def _lookup_returns(raw: Any) -> dict[str, Any]:
@@ -363,7 +320,7 @@ def _live_view(
     targeted: list[str],
     returns: dict[str, Any],
     done: set[str],
-    dead: set[str],
+    missing: set[str],
     spinner: Spinner,
     *,
     n_cells: int,
@@ -371,8 +328,11 @@ def _live_view(
 ) -> Group:
     """A live checklist: a tick for finished minions (with ``cells_for`` of
     their reply in aligned columns), a spinner for the ones still running, an x
-    for the unreachable, under a one-line status header. ``n_cells`` is how
-    many trailing columns ``cells_for`` produces (so blank rows stay aligned)."""
+    for those that never reported, under a one-line status header. ``missing``
+    is only populated in the final frame (after the deadline or a Ctrl+C); while
+    polling it's empty, so still-pending minions show a spinner. ``n_cells`` is
+    how many trailing columns ``cells_for`` produces (so blank rows stay
+    aligned)."""
     blanks = [Text("")] * n_cells
     grid = Table.grid(padding=(0, 1))
     grid.add_column(no_wrap=True)  # marker
@@ -380,7 +340,7 @@ def _live_view(
     for _ in range(n_cells):  # per-command trailing columns
         grid.add_column(no_wrap=True, justify="left")
     for minion in targeted:
-        if minion in dead:
+        if minion in missing:
             grid.add_row(Text("X", style="red"), Text(minion, style="dim"), *blanks)
         elif minion in done:
             grid.add_row(
@@ -389,12 +349,12 @@ def _live_view(
         else:
             grid.add_row(spinner, Text(minion, style="dim"), *blanks)
 
-    pending = len(targeted) - len(done) - len(dead)
+    pending = len(targeted) - len(done) - len(missing)
     bits = [f"{len(done)}/{len(targeted)} done"]
     if pending:
         bits.append(f"{pending} running")
-    if dead:
-        bits.append(f"[red]{len(dead)} unreachable[/]")
+    if missing:
+        bits.append(f"[red]{len(missing)} no response[/]")
     header = Text.from_markup(f"[dim]{'  '.join(bits)}[/]")
     return Group(header, grid)
 
@@ -405,17 +365,19 @@ def _stream_job(
     *,
     n_cells: int,
     cells_for: Callable[[Any], list[Text]],
-) -> tuple[dict[str, Any], set[str], set[str], float] | None:
+) -> tuple[dict[str, Any], set[str], float, bool] | None:
     """Fire a job async, show a live checklist, and return its raw results.
 
     Submits ``payload`` via the ``local_async`` client (returns a job id at
     once), then polls ``runner jobs.lookup_jid`` until every targeted minion
-    has returned or the deadline trips. While polling it shows a live
-    per-minion checklist (spinner -> tick), whose trailing columns come from
-    ``cells_for(value)`` (``n_cells`` of them). Once the run is done the live
-    view is cleared and this returns ``(returns, dead, expected, start)`` for
-    the caller to render — or ``None`` if no job started (already reported).
-    ``call(name, **kw)`` invokes the named salt-api client."""
+    has returned, the deadline trips, or the user hits Ctrl+C. While polling it
+    shows a live per-minion checklist (spinner -> tick), whose trailing columns
+    come from ``cells_for(value)`` (``n_cells`` of them). In every case it then
+    renders the final checklist frame and returns ``(returns, outstanding,
+    start, interrupted)`` — ``outstanding`` being the targeted minions that
+    never reported — for the caller to render, or ``None`` if no job started
+    (already reported). ``call(name, **kw)`` invokes the named salt-api
+    client."""
     submit = call("local_async", **payload)
     info: Any = _first_return(submit)
     jid = info.get("jid")
@@ -435,71 +397,70 @@ def _stream_job(
         console.print("(no minions matched the target)")
         return None
 
-    expected = set(targeted)  # shrinks as unreachable minions are dropped
+    expected = set(targeted)
     console.print(f"[dim]job {jid} -> {len(targeted)} minion(s)[/]")
     start = time.monotonic()
     returns: dict[str, Any] = {}
-    dead: set[str] = set()  # probed and confirmed not running the job
     spinner = Spinner("dots", style="cyan")
 
-    def view() -> Group:
+    def view(missing: set[str] | None = None) -> Group:
         done = expected & set(returns)
         return _live_view(
-            targeted, returns, done, dead, spinner, n_cells=n_cells, cells_for=cells_for
+            targeted,
+            returns,
+            done,
+            missing or set(),
+            spinner,
+            n_cells=n_cells,
+            cells_for=cells_for,
         )
 
-    # transient=False keeps the finished checklist on screen above the
-    # rendered tables, as a persistent at-a-glance record of the run.
+    # Poll lookup_jid until everyone's back or the deadline trips; Ctrl+C stops
+    # waiting early. The job keeps running on the minions either way — we just
+    # stop watching and render whatever was gathered. transient=False keeps the
+    # finished checklist on screen above the rendered tables.
+    interrupted = False
     with Live(console=console, refresh_per_second=12, transient=False) as live:
-        prev_done = -1
-        last_change = start
-        while True:
-            # lookup_jid is cumulative: each poll returns every minion that has
-            # reported so far, so we just keep the latest snapshot.
-            returns = _lookup_returns(
-                _first_return(call("runner", fun="jobs.lookup_jid", kwarg={"jid": jid}))
-            )
-            done = expected & set(returns)
-            now = time.monotonic()
-            if len(done) != prev_done:
-                prev_done, last_change = len(done), now
-            live.update(view())
+        try:
+            while True:
+                # lookup_jid is cumulative: each poll returns every minion that
+                # has reported so far, so we just keep the latest snapshot.
+                returns = _lookup_returns(
+                    _first_return(
+                        call("runner", fun="jobs.lookup_jid", kwarg={"jid": jid})
+                    )
+                )
+                live.update(view())
+                if not expected - set(returns):
+                    break
+                if time.monotonic() - start > _POLL_DEADLINE:
+                    break
+                time.sleep(_POLL_INTERVAL)
+        except KeyboardInterrupt:
+            interrupted = True
+        # Final frame: mark whoever never reported so the persisted checklist
+        # reflects the true end state rather than a frozen spinner.
+        outstanding = expected - set(returns)
+        live.update(view(outstanding))
 
-            if not expected - done:
-                break
-
-            # Stalled? Ask the stragglers whether they're still running the
-            # job; drop the ones that aren't (down or lost it) so we stop
-            # waiting on them instead of blocking to the deadline.
-            if now - last_change > _GATHER_TIMEOUT:
-                gone = _find_dead(call, jid, expected - done)
-                if gone:
-                    dead |= gone
-                    expected -= gone
-                    last_change = now  # don't re-probe every single poll
-                    live.update(view())
-                    if not expected - done:
-                        break
-
-            if now - start > _POLL_DEADLINE:
-                break
-            time.sleep(_POLL_INTERVAL)
-
-    return returns, dead, expected, start
+    return returns, expected - set(returns), start, interrupted
 
 
-def _print_stragglers(dead: set[str], stalled: list[str]) -> None:
-    """The shared trailer for a streamed job: who never answered and who was
-    still running when the deadline tripped."""
-    if dead:
+def _print_outstanding(outstanding: set[str], interrupted: bool) -> None:
+    """Trailer naming the minions that hadn't reported when we stopped waiting
+    — because the user interrupted, or the deadline tripped."""
+    if not outstanding:
+        return
+    names = ", ".join(sorted(outstanding, key=_natural_key))
+    if interrupted:
         console.print(
-            f"[yellow]no response from: {', '.join(sorted(dead, key=_natural_key))} "
-            f"(down, or no longer running the job)[/]"
+            f"[yellow]stopped waiting (Ctrl+C); no result yet from: {names} "
+            f"- the job may still be running on them[/]"
         )
-    if stalled:
+    else:
         console.print(
-            f"[yellow]still running at the {int(_POLL_DEADLINE)}s deadline: "
-            f"{', '.join(stalled)}[/]"
+            f"[yellow]no result from: {names} within the "
+            f"{int(_POLL_DEADLINE)}s deadline (still running, or down)[/]"
         )
 
 
@@ -509,11 +470,11 @@ def _stream_state(call: Callable[..., dict[str, Any]], payload: dict[str, Any]) 
     result = _stream_job(call, payload, n_cells=5, cells_for=_state_cells)
     if result is None:
         return
-    returns, dead, expected, start = result
+    returns, outstanding, start, interrupted = result
 
     # Live view cleared — render the coloured tables, one block per minion.
     _print_state_result({"return": [returns]})
-    _print_stragglers(dead, sorted(expected - set(returns) - dead, key=_natural_key))
+    _print_outstanding(outstanding, interrupted)
 
     # Fleet-wide summary: totals across all minions + wall-clock elapsed.
     totals, n = _grand_totals(returns)
@@ -673,10 +634,10 @@ def _stream_cmd(call: Callable[..., dict[str, Any]], payload: dict[str, Any]) ->
     result = _stream_job(call, payload, n_cells=1, cells_for=_cmd_cells)
     if result is None:
         return
-    returns, dead, expected, start = result
+    returns, outstanding, start, interrupted = result
 
     _print_cmd_result({"return": [returns]})
-    _print_stragglers(dead, sorted(expected - set(returns) - dead, key=_natural_key))
+    _print_outstanding(outstanding, interrupted)
 
     n = len(returns)
     if n:

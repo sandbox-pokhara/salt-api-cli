@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from typing import Any, Callable, cast
@@ -489,13 +490,22 @@ def run_state(args: argparse.Namespace, call: Callable[..., dict[str, Any]]) -> 
 # --------------------------------------------------------------------------
 
 
+def _natural_key(name: str) -> list[object]:
+    """Sort key that orders embedded numbers numerically (bml2 before bml10)."""
+    return [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", name)]
+
+
 def _print_key_panels(data: dict[str, Any]) -> None:
-    """Render key.list_all as one panel per acceptance status."""
-    panels: list[Panel] = []
+    """Render key.list_all as one stacked panel per acceptance status, the
+    IDs flowed into aligned columns inside each panel."""
     for status_key, (label, color) in _KEY_PANELS.items():
-        keys: list[str] = data.get(status_key, [])
-        body: Any = Text("\n".join(keys)) if keys else Text("(none)", style="dim")
-        panels.append(
+        keys: list[str] = sorted(data.get(status_key, []), key=_natural_key)
+        body: Any = (
+            Columns([Text(k) for k in keys], padding=(0, 2))
+            if keys
+            else Text("(none)", style="dim")
+        )
+        console.print(
             Panel(
                 body,
                 title=f"{label} ({len(keys)})",
@@ -503,7 +513,6 @@ def _print_key_panels(data: dict[str, Any]) -> None:
                 border_style=color,
             )
         )
-    console.print(Columns(panels, equal=True, expand=False))
 
 
 def run_keys(args: argparse.Namespace, call: Callable[..., dict[str, Any]]) -> None:

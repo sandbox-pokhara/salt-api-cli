@@ -169,12 +169,7 @@ def _print_state_return(minion: str, states: dict[str, Any]) -> None:
     """Render one minion's state run: header, a table of states, summary."""
     ordered = sorted(states.items(), key=lambda kv: kv[1].get("__run_num__", 1 << 30))
 
-    table = Table(box=None, show_header=False, pad_edge=False)
-    table.add_column("marker", no_wrap=True)
-    table.add_column("function", style="cyan", no_wrap=True)
-    table.add_column("ref", style="dim", no_wrap=True)
-    table.add_column("detail", no_wrap=True, overflow="ellipsis")
-
+    rows: list[tuple[Text, str, str, str | Text]] = []
     for key, state in ordered:
         status = _state_status(state)
         marker, style = _STATUS_STYLE[status]
@@ -188,7 +183,28 @@ def _print_state_return(minion: str, states: dict[str, Any]) -> None:
             detail = Text(_short(state.get("comment", ""), 240), style="red")
         else:  # diff / skip
             detail = _short(state.get("comment", ""))
-        table.add_row(Text(marker, style=style), _state_function(key), ref, detail)
+        rows.append((Text(marker, style=style), _state_function(key), ref, detail))
+
+    # Pin the detail column to whatever width is left so rich shrinks *it*
+    # (ellipsis) rather than collapsing the short marker/function/ref columns
+    # to nothing on a narrow terminal. Width budget: 2-space left Padding +
+    # 1-char marker + the natural function/ref widths + three 2-space column
+    # gaps (pad_edge=False). Floor at 20 so detail never vanishes outright.
+    fn_w = max((len(fn) for _, fn, _, _ in rows), default=8)
+    ref_w = max((len(ref) for _, _, ref, _ in rows), default=8)
+    nat_w = max(
+        (len(d.plain if isinstance(d, Text) else d) for _, _, _, d in rows), default=0
+    )
+    detail_w = min(nat_w, max(20, console.width - 2 - 1 - fn_w - ref_w - 3 * 2))
+
+    table = Table(box=None, show_header=False, pad_edge=False)
+    table.add_column("marker", no_wrap=True)
+    table.add_column("function", style="cyan", no_wrap=True)
+    table.add_column("ref", style="dim", no_wrap=True)
+    table.add_column("detail", no_wrap=True, overflow="ellipsis", width=detail_w)
+
+    for row in rows:
+        table.add_row(*row)
 
     counts, total_ms = _count_states(states)
     console.print(Text(minion, style="bold"))
@@ -404,8 +420,14 @@ def _stream_job(
     info: Any = _first_return(submit)
     jid = info.get("jid")
     if not jid:
-        # No job id: nothing matched, or salt-api answered with an error body.
-        console.print_json(json.dumps(submit))
+        # No job id: either nothing matched (salt-api hands back an empty
+        # body, e.g. {"return": [{}]}) or it answered with an error body. An
+        # empty info means no minions matched — say so plainly; reserve the
+        # raw JSON dump for an actual error worth showing verbatim.
+        if not info:
+            console.print("(no minions matched the target)")
+        else:
+            console.print_json(json.dumps(submit))
         return None
 
     targeted = sorted(info.get("minions") or [], key=_natural_key)

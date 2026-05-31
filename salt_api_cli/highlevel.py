@@ -334,33 +334,42 @@ def _count_cells(counts: dict[str, int]) -> list[Text]:
     ]
 
 
+def _state_cells(val: Any) -> list[Text]:
+    """The five live-view columns for a finished minion's state return: its
+    per-status tally, or a placeholder (plus blanks) for a non-state reply."""
+    if _is_state_return(val):
+        counts, _ = _count_states(cast("dict[str, Any]", val))
+        return _count_cells(counts)
+    return [Text("(no state output)", style="dim"), *[Text("")] * 4]
+
+
 def _live_view(
     targeted: list[str],
     returns: dict[str, Any],
     done: set[str],
     dead: set[str],
     spinner: Spinner,
+    *,
+    n_cells: int,
+    cells_for: Callable[[Any], list[Text]],
 ) -> Group:
-    """A live checklist: a tick for finished minions (with their per-state
-    tally in aligned columns), a spinner for the ones still running, an x for
-    the unreachable, under a one-line status header."""
-    blanks = [Text("")] * 5  # the five count columns, empty
+    """A live checklist: a tick for finished minions (with ``cells_for`` of
+    their reply in aligned columns), a spinner for the ones still running, an x
+    for the unreachable, under a one-line status header. ``n_cells`` is how
+    many trailing columns ``cells_for`` produces (so blank rows stay aligned)."""
+    blanks = [Text("")] * n_cells
     grid = Table.grid(padding=(0, 1))
     grid.add_column(no_wrap=True)  # marker
     grid.add_column(no_wrap=True)  # minion id
-    for _ in range(5):  # ok / changed / would-change / skipped / failed
+    for _ in range(n_cells):  # per-command trailing columns
         grid.add_column(no_wrap=True, justify="left")
     for minion in targeted:
         if minion in dead:
             grid.add_row(Text("✗", style="red"), Text(minion, style="dim"), *blanks)
         elif minion in done:
-            val = returns.get(minion)
-            if _is_state_return(val):
-                counts, _ = _count_states(cast("dict[str, Any]", val))
-                cells = _count_cells(counts)
-            else:
-                cells = [Text("(no state output)", style="dim"), *blanks[1:]]
-            grid.add_row(Text("✓", style="green"), Text(minion), *cells)
+            grid.add_row(
+                Text("✓", style="green"), Text(minion), *cells_for(returns.get(minion))
+            )
         else:
             grid.add_row(spinner, Text(minion, style="dim"), *blanks)
 
@@ -374,27 +383,35 @@ def _live_view(
     return Group(header, grid)
 
 
-def _stream_state(call: Callable[..., dict[str, Any]], payload: dict[str, Any]) -> None:
-    """Fire a state job async, show a live checklist, then render the results.
+def _stream_job(
+    call: Callable[..., dict[str, Any]],
+    payload: dict[str, Any],
+    *,
+    n_cells: int,
+    cells_for: Callable[[Any], list[Text]],
+) -> tuple[dict[str, Any], set[str], set[str], float] | None:
+    """Fire a job async, show a live checklist, and return its raw results.
 
-    Submits via the ``local_async`` client (returns a job id at once), then
-    polls ``runner jobs.lookup_jid`` until every targeted minion has returned
-    or the deadline trips. While polling it shows a live per-minion checklist
-    (spinner -> tick). Once the run is done the live view is cleared and the
-    coloured per-minion tables print together, followed by a fleet-wide
-    summary. ``call(name, **kw)`` invokes the named salt-api client."""
+    Submits ``payload`` via the ``local_async`` client (returns a job id at
+    once), then polls ``runner jobs.lookup_jid`` until every targeted minion
+    has returned or the deadline trips. While polling it shows a live
+    per-minion checklist (spinner -> tick), whose trailing columns come from
+    ``cells_for(value)`` (``n_cells`` of them). Once the run is done the live
+    view is cleared and this returns ``(returns, dead, expected, start)`` for
+    the caller to render — or ``None`` if no job started (already reported).
+    ``call(name, **kw)`` invokes the named salt-api client."""
     submit = call("local_async", **payload)
     info: Any = _first_return(submit)
     jid = info.get("jid")
     if not jid:
         # No job id: nothing matched, or salt-api answered with an error body.
         console.print_json(json.dumps(submit))
-        return
+        return None
 
-    targeted = sorted(info.get("minions") or [])
+    targeted = sorted(info.get("minions") or [], key=_natural_key)
     if not targeted:
         console.print("(no minions matched the target)")
-        return
+        return None
 
     expected = set(targeted)  # shrinks as unreachable minions are dropped
     console.print(f"[dim]job {jid} -> {len(targeted)} minion(s)[/]")
@@ -402,6 +419,12 @@ def _stream_state(call: Callable[..., dict[str, Any]], payload: dict[str, Any]) 
     returns: dict[str, Any] = {}
     dead: set[str] = set()  # probed and confirmed not running the job
     spinner = Spinner("dots", style="cyan")
+
+    def view() -> Group:
+        done = expected & set(returns)
+        return _live_view(
+            targeted, returns, done, dead, spinner, n_cells=n_cells, cells_for=cells_for
+        )
 
     # transient=False keeps the finished checklist on screen above the
     # rendered tables, as a persistent at-a-glance record of the run.
@@ -418,7 +441,7 @@ def _stream_state(call: Callable[..., dict[str, Any]], payload: dict[str, Any]) 
             now = time.monotonic()
             if len(done) != prev_done:
                 prev_done, last_change = len(done), now
-            live.update(_live_view(targeted, returns, done, dead, spinner))
+            live.update(view())
 
             if not expected - done:
                 break
@@ -432,7 +455,7 @@ def _stream_state(call: Callable[..., dict[str, Any]], payload: dict[str, Any]) 
                     dead |= gone
                     expected -= gone
                     last_change = now  # don't re-probe every single poll
-                    live.update(_live_view(targeted, returns, done, dead, spinner))
+                    live.update(view())
                     if not expected - done:
                         break
 
@@ -440,19 +463,35 @@ def _stream_state(call: Callable[..., dict[str, Any]], payload: dict[str, Any]) 
                 break
             time.sleep(_POLL_INTERVAL)
 
-    # Live view cleared — render the coloured tables, one block per minion.
-    _print_state_result({"return": [returns]})
+    return returns, dead, expected, start
+
+
+def _print_stragglers(dead: set[str], stalled: list[str]) -> None:
+    """The shared trailer for a streamed job: who never answered and who was
+    still running when the deadline tripped."""
     if dead:
         console.print(
-            f"[yellow]no response from: {', '.join(sorted(dead))} "
+            f"[yellow]no response from: {', '.join(sorted(dead, key=_natural_key))} "
             f"(down, or no longer running the job)[/]"
         )
-    stalled = sorted(expected - set(returns) - dead)
     if stalled:
         console.print(
             f"[yellow]still running at the {int(_POLL_DEADLINE)}s deadline: "
             f"{', '.join(stalled)}[/]"
         )
+
+
+def _stream_state(call: Callable[..., dict[str, Any]], payload: dict[str, Any]) -> None:
+    """Stream a state job, then render the coloured per-minion tables and a
+    fleet-wide summary."""
+    result = _stream_job(call, payload, n_cells=5, cells_for=_state_cells)
+    if result is None:
+        return
+    returns, dead, expected, start = result
+
+    # Live view cleared — render the coloured tables, one block per minion.
+    _print_state_result({"return": [returns]})
+    _print_stragglers(dead, sorted(expected - set(returns) - dead, key=_natural_key))
 
     # Fleet-wide summary: totals across all minions + wall-clock elapsed.
     totals, n = _grand_totals(returns)
@@ -594,15 +633,58 @@ def _print_cmd_result(resp: dict[str, Any]) -> None:
         _print_cmd_one(minion, results[minion])
 
 
-def run_cmd(args: argparse.Namespace, call: Callable[..., dict[str, Any]]) -> None:
-    """The ``salt cmd`` command, layered over the local client + ``cmd.run_all``.
+def _cmd_cells(val: Any) -> list[Text]:
+    """The single live-view column for a finished minion's ``cmd.run_all``
+    reply: its exit code, green for 0 and red otherwise."""
+    if isinstance(val, dict):
+        retcode = cast("dict[str, Any]", val).get("retcode")
+        if retcode == 0:
+            return [Text("exit 0", style="green")]
+        if retcode is not None:
+            return [Text(f"exit {retcode}", style="red")]
+    return [Text("(no output)", style="dim")]
 
-    Runs a shell command on the targeted minions and renders each minion's
-    result readably (exit code, stdout, stderr) instead of the raw JSON the
-    low-level ``local`` command would emit. Trailing ``key=value`` args are
-    forwarded as kwargs to ``cmd.run_all`` (e.g. ``shell=powershell``,
-    ``cwd=...``, ``runas=...``). ``call(name, **kw)`` invokes the named
-    salt-api client (cli.py binds it to the configured connection)."""
+
+def _stream_cmd(call: Callable[..., dict[str, Any]], payload: dict[str, Any]) -> None:
+    """Stream a ``cmd.run_all`` job, then render each minion's output block and
+    a fleet-wide ok/failed summary."""
+    result = _stream_job(call, payload, n_cells=1, cells_for=_cmd_cells)
+    if result is None:
+        return
+    returns, dead, expected, start = result
+
+    _print_cmd_result({"return": [returns]})
+    _print_stragglers(dead, sorted(expected - set(returns) - dead, key=_natural_key))
+
+    n = len(returns)
+    if n:
+        ok = sum(
+            1
+            for v in returns.values()
+            if isinstance(v, dict) and cast("dict[str, Any]", v).get("retcode") == 0
+        )
+        fail = n - ok
+        wall = _fmt_duration((time.monotonic() - start) * 1000.0)
+        tally = f"[green]{ok} ok[/]   " + (
+            f"[red]{fail} failed[/]" if fail else f"{fail} failed"
+        )
+        console.print("[dim]===[/]")
+        console.print(f"[bold]{n} minion(s)[/]   {tally}   [dim]took {wall}[/]")
+
+
+def run_cmd(args: argparse.Namespace, call: Callable[..., dict[str, Any]]) -> None:
+    """The ``salt cmd`` command, layered over ``local_async`` + ``cmd.run_all``.
+
+    Runs a shell command on the targeted minions and streams the results: a
+    live per-minion checklist (spinner -> exit code) while the job runs, then a
+    readable block per minion (exit code, stdout, stderr) and an ok/failed
+    summary — instead of the raw JSON the low-level ``local`` command emits.
+    Like ``state``, it fires the job async and polls the runner so a slow or
+    wide command never holds one long connection open against the gateway cap.
+    Trailing ``key=value`` args are forwarded as kwargs to ``cmd.run_all``
+    (e.g. ``shell=powershell``, ``cwd=...``, ``runas=...``). ``call(name,
+    **kw)`` invokes the named salt-api client (cli.py binds it to the
+    configured connection)."""
     pos, kw = split_args(list(getattr(args, "args", None) or []))
     payload: dict[str, Any] = {
         "tgt": args.target,
@@ -611,4 +693,4 @@ def run_cmd(args: argparse.Namespace, call: Callable[..., dict[str, Any]]) -> No
     }
     if kw:
         payload["kwarg"] = kw
-    _print_cmd_result(call("local", **payload))
+    _stream_cmd(call, payload)

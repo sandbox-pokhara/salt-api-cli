@@ -17,7 +17,7 @@ Commands come in two layers:
 
 - **Low-level** (`local`, `runner`, `wheel`) map directly to the salt-api
   clients and print **raw JSON**.
-- **High-level** (`state`, `keys`) wrap those clients and render
+- **High-level** (`cmd`, `state`, `keys`) wrap those clients and render
   **readable, colorized output** with `rich`.
 
 ## Installation
@@ -77,6 +77,13 @@ salt wheel key.list_all
 These wrap the low-level clients and render their output with `rich`.
 
 ```
+# Run a shell command — a live per-minion checklist while it runs, then
+# one block per minion (exit code, stdout, stderr) and an ok/failed summary.
+# Fired async (local_async + cmd.run_all) and polled via the runner, like
+# `state`, so a slow or wide command never holds one long connection open.
+salt cmd 'bml*' hostname
+salt cmd 'bml1' 'Get-Date' shell=powershell
+
 # State runs — a colored table of states, one row each, with a summary.
 # Driven by the local client + state.* functions.
 salt state highstate 'bml1'           # apply the highstate

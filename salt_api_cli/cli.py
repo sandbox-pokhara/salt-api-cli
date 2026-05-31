@@ -75,6 +75,13 @@ def _run_keys(cfg: Config, args: argparse.Namespace) -> None:
     highlevel.run_keys(args, wheel)
 
 
+def _run_cmd(cfg: Config, args: argparse.Namespace) -> None:
+    def client(name: str, **kw: Any) -> dict[str, Any]:
+        return call(cfg, name, **kw)
+
+    highlevel.run_cmd(args, client)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="salt",
@@ -88,6 +95,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "  salt runner manage.status\n"
             "  salt wheel key.list_all\n"
             "high-level (readable):\n"
+            "  salt cmd 'bml*' hostname\n"
+            "  salt cmd 'bml1' 'Get-Date' shell=powershell\n"
             "  salt state highstate 'bml1'\n"
             "  salt state test 'bml1'              # dry-run highstate (test=True)\n"
             "  salt state apply 'bml1' veyon\n"
@@ -132,6 +141,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_wheel = sub.add_parser("wheel", help="invoke a master-side wheel function")
     p_wheel.add_argument("function")
     p_wheel.add_argument("args", nargs=argparse.REMAINDER)
+
+    p_cmd = sub.add_parser("cmd", help="run a shell command with readable output")
+    p_cmd.add_argument("target", help="minion target (id or glob)")
+    p_cmd.add_argument("cmdline", metavar="command", help="shell command to run")
+    p_cmd.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        help="key=value args, e.g. shell=powershell",
+    )
 
     p_state = sub.add_parser("state", help="apply states with readable output")
     state_sub = p_state.add_subparsers(dest="action", required=True)
@@ -192,6 +210,8 @@ def main() -> None:
             _run_client(cfg, "runner", args)
         elif args.command == "wheel":
             _run_client(cfg, "wheel", args)
+        elif args.command == "cmd":
+            _run_cmd(cfg, args)
         elif args.command == "state":
             _run_state(cfg, args)
         elif args.command == "keys":

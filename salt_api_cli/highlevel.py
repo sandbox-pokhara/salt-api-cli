@@ -545,3 +545,70 @@ def run_keys(args: argparse.Namespace, call: Callable[..., dict[str, Any]]) -> N
         label = _KEY_PANELS.get(status_key, (status_key, "white"))[0]
         joined = ", ".join(ids) if ids else "[dim](none)[/]"
         console.print(f"{label}: {joined}")
+
+
+# --------------------------------------------------------------------------
+# command execution
+# --------------------------------------------------------------------------
+
+
+def _print_cmd_one(minion: str, val: Any) -> None:
+    """Render one minion's ``cmd.run_all`` reply: a bold id with its exit code
+    (green for 0, red otherwise), then stdout and any stderr indented beneath.
+
+    Falls back to printing the raw value for any non-dict shape — e.g. a
+    minion that errored before the command ran, where salt returns a string."""
+    if not isinstance(val, dict):
+        console.print(Text(minion, style="bold"))
+        console.print(Padding(Text(str(val)), (0, 0, 0, 2)))
+        return
+
+    record = cast("dict[str, Any]", val)
+    retcode = record.get("retcode")
+    header = Text(minion, style="bold")
+    if retcode == 0:
+        header.append("  exit 0", style="green")
+    elif retcode is not None:
+        header.append(f"  exit {retcode}", style="red")
+    console.print(header)
+
+    stdout = str(record.get("stdout", "")).rstrip()
+    stderr = str(record.get("stderr", "")).rstrip()
+    if stdout:
+        console.print(Padding(Text(stdout), (0, 0, 0, 2)))
+    if stderr:
+        console.print(Padding(Text("stderr:", style="red"), (0, 0, 0, 2)))
+        console.print(Padding(Text(stderr, style="red"), (0, 0, 0, 4)))
+    if not stdout and not stderr:
+        console.print(Padding(Text("(no output)", style="dim"), (0, 0, 0, 2)))
+
+
+def _print_cmd_result(resp: dict[str, Any]) -> None:
+    """Render a ``cmd.run_all`` reply, one block per minion (naturally sorted)."""
+    ret = _first_return(resp)
+    if not isinstance(ret, dict) or not ret:
+        console.print("(no minions responded)")
+        return
+    results = cast("dict[str, Any]", ret)
+    for minion in sorted(results, key=_natural_key):
+        _print_cmd_one(minion, results[minion])
+
+
+def run_cmd(args: argparse.Namespace, call: Callable[..., dict[str, Any]]) -> None:
+    """The ``salt cmd`` command, layered over the local client + ``cmd.run_all``.
+
+    Runs a shell command on the targeted minions and renders each minion's
+    result readably (exit code, stdout, stderr) instead of the raw JSON the
+    low-level ``local`` command would emit. Trailing ``key=value`` args are
+    forwarded as kwargs to ``cmd.run_all`` (e.g. ``shell=powershell``,
+    ``cwd=...``, ``runas=...``). ``call(name, **kw)`` invokes the named
+    salt-api client (cli.py binds it to the configured connection)."""
+    pos, kw = split_args(list(getattr(args, "args", None) or []))
+    payload: dict[str, Any] = {
+        "tgt": args.target,
+        "fun": "cmd.run_all",
+        "arg": [args.cmdline, *pos],
+    }
+    if kw:
+        payload["kwarg"] = kw
+    _print_cmd_result(call("local", **payload))

@@ -60,9 +60,9 @@ verbatim as indented JSON.
 
 ```
 # Local client — fan out to minions
-salt local '*' test.ping
-salt local 'bml*' cmd.run 'whoami'
-salt local 'bml1' cmd.run 'Get-Date' shell=powershell
+salt local "*" test.ping
+salt local "bml*" cmd.run whoami
+salt local "bml1" cmd.run "Get-Date" shell=powershell
 
 # Runner client (master-side: manage.status, jobs.list_jobs, ...)
 salt runner manage.status
@@ -81,23 +81,23 @@ These wrap the low-level clients and render their output with `rich`.
 # one block per minion (exit code, stdout, stderr) and an ok/failed summary.
 # Fired async (local_async + cmd.run_all) and polled via the runner, like
 # `state`, so a slow or wide command never holds one long connection open.
-salt cmd 'bml*' hostname
-salt cmd 'bml1' 'Get-Date' shell=powershell
+salt cmd "bml*" hostname
+salt cmd "bml1" "Get-Date" shell=powershell
 
 # State runs — a colored table of states, one row each, with a summary.
 # Driven by the local client + state.* functions.
-salt state highstate 'bml1'           # apply the highstate
-salt state test 'bml1'                # dry-run the highstate (forces test=True)
-salt state apply 'bml1' veyon         # apply specific sls module(s)
-salt state apply 'bml1' veyon.ldap test=True
+salt state highstate "bml1"           # apply the highstate
+salt state test "bml1"                # dry-run the highstate (forces test=True)
+salt state apply "bml1" veyon         # apply specific sls module(s)
+salt state apply "bml1" veyon.ldap test=True
 
 # Key management — wraps the wheel client's key.* functions.
 # `keys list` shows one colored panel per status (Accepted/Pending/Denied/Rejected).
 salt keys list
-salt keys accept <id-or-glob>
+salt keys accept "<id-or-glob>"
 salt keys accept-all
-salt keys reject <id-or-glob>
-salt keys delete <id-or-glob>
+salt keys reject "<id-or-glob>"
+salt keys delete "<id-or-glob>"
 ```
 
 Color and panels appear when writing to a terminal; output is plain when

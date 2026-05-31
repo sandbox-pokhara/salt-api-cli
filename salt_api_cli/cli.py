@@ -88,20 +88,24 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Thin Python CLI for salt-api.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
+            'quote glob targets with double quotes ("bml*") - they work in\n'
+            "bash, PowerShell, and cmd.exe alike (single quotes are not quotes\n"
+            "in cmd.exe, so 'bml*' there reaches salt with the quotes attached).\n"
+            "\n"
             "low-level (raw JSON):\n"
-            "  salt local '*' test.ping\n"
-            "  salt local 'bml*' cmd.run 'whoami'\n"
-            "  salt local 'bml1' cmd.run 'Get-Date' shell=powershell\n"
+            '  salt local "*" test.ping\n'
+            '  salt local "bml*" cmd.run whoami\n'
+            '  salt local "bml1" cmd.run "Get-Date" shell=powershell\n'
             "  salt runner manage.status\n"
             "  salt wheel key.list_all\n"
             "high-level (readable):\n"
-            "  salt cmd 'bml*' hostname\n"
-            "  salt cmd 'bml1' 'Get-Date' shell=powershell\n"
-            "  salt state highstate 'bml1'\n"
-            "  salt state test 'bml1'              # dry-run highstate (test=True)\n"
-            "  salt state apply 'bml1' veyon\n"
+            '  salt cmd "bml*" hostname\n'
+            '  salt cmd "bml1" "Get-Date" shell=powershell\n'
+            '  salt state highstate "bml1"\n'
+            '  salt state test "bml1"              # dry-run highstate (test=True)\n'
+            '  salt state apply "bml1" veyon\n'
             "  salt keys list\n"
-            "  salt keys accept '<id-or-glob>'\n"
+            '  salt keys accept "<id-or-glob>"\n'
             "  salt keys accept-all\n"
         ),
     )

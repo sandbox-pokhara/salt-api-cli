@@ -365,10 +365,10 @@ def _live_view(
         grid.add_column(no_wrap=True, justify="left")
     for minion in targeted:
         if minion in dead:
-            grid.add_row(Text("✗", style="red"), Text(minion, style="dim"), *blanks)
+            grid.add_row(Text("X", style="red"), Text(minion, style="dim"), *blanks)
         elif minion in done:
             grid.add_row(
-                Text("✓", style="green"), Text(minion), *cells_for(returns.get(minion))
+                Text("+", style="green"), Text(minion), *cells_for(returns.get(minion))
             )
         else:
             grid.add_row(spinner, Text(minion, style="dim"), *blanks)

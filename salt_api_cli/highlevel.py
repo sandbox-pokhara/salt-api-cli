@@ -41,7 +41,7 @@ from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
-from salt_api_cli.lowlevel import split_args
+from salt_api_cli.lowlevel import SaltApiError, split_args
 
 console = Console()
 
@@ -270,15 +270,36 @@ def _print_state_result(result: dict[str, Any]) -> None:
 # before giving up on minions that never reported. Each poll is a fast,
 # self-contained request, so the proxy/gateway connection cap never bites.
 #
-# We don't probe minion liveness (saltutil.find_job): an empty probe is
-# ambiguous — a busy-but-alive Windows minion mid-highstate can simply fail to
-# answer in time and look identical to a down one, so probing wrongly dropped
-# live minions. Instead we just poll until every targeted minion has returned
-# or _POLL_DEADLINE trips, then render whatever came back. The job keeps
-# running on the minions regardless; results stay fetchable later by jid. Press
-# Ctrl+C to stop waiting early and render the partial results gathered so far.
+# We can't probe minion liveness mid-job (saltutil.find_job): an empty probe
+# is ambiguous — a busy-but-alive Windows minion mid-highstate can simply fail
+# to answer in time and look identical to a down one, so probing wrongly
+# dropped live minions. Connection-level presence (the manage.present runner)
+# is no better here: it matches connection source IPs against cached minion
+# addresses, which NAT breaks, so it reports every minion absent. What does
+# work is liveness pings (test.ping): one published immediately *before* the
+# real job, while each minion's job loop is still idle, then re-published to
+# whoever stays silent every _PING_INTERVAL. A minion that answers any ping —
+# late answers count too — is provably alive and worth waiting for. One that
+# has ignored the job plus _OFFLINE_PINGS pings (each at least _PING_GRACE
+# old) is tagged "silent", and after _OFFLINE_AFTER of unbroken silence it is
+# presumed offline; once every minion still outstanding is offline we stop
+# waiting. The long fuse matters because of the NAT half-dead case: a minion
+# whose stale connection swallowed the publish (so it never received the job)
+# typically reconnects within a couple of minutes — TCP keepalive bounds it —
+# and answers a fresh ping after ignoring several. On that signature the job
+# is re-sent to it (published jobs are not queued for disconnected minions,
+# so this is never a double run), up to _MAX_RESEND times. Otherwise we poll
+# until every targeted minion has returned or _POLL_DEADLINE trips, then
+# render whatever came back. The job keeps running on the minions regardless;
+# results stay fetchable later by jid. Press Ctrl+C to stop waiting early and
+# render the partial results gathered so far.
 _POLL_INTERVAL = 3.0
 _POLL_DEADLINE = 1800.0  # 30 minutes (hard backstop)
+_PING_INTERVAL = 20.0  # re-ping still-silent minions this often
+_PING_GRACE = 15.0  # how long a ping may go unanswered before it counts missed
+_OFFLINE_PINGS = 3  # missed pings before a silent minion is tagged as such
+_OFFLINE_AFTER = 180.0  # unbroken silence before "silent" hardens to offline
+_MAX_RESEND = 1  # times the job is re-sent to a minion that reconnects
 
 
 def _first_return(resp: dict[str, Any]) -> Any:
@@ -301,6 +322,21 @@ def _lookup_returns(raw: Any) -> dict[str, Any]:
     data = cast("dict[str, Any]", raw)
     inner = data.get("data")
     return cast("dict[str, Any]", inner) if isinstance(inner, dict) else data
+
+
+def _submit_async(call: Callable[..., dict[str, Any]], **payload: Any) -> str | None:
+    """Submit a ``local_async`` job and return its jid, or ``None`` if the
+    submission failed or matched nothing — callers treat that as "no job",
+    never as an error worth aborting the run for (these are the auxiliary
+    liveness pings and re-sends, not the main job)."""
+    try:
+        info: Any = _first_return(call("local_async", **payload))
+    except SaltApiError:
+        return None
+    if not isinstance(info, dict):
+        return None
+    jid = cast("dict[str, Any]", info).get("jid")
+    return str(jid) if jid else None
 
 
 def _count_cells(counts: dict[str, int]) -> list[Text]:
@@ -341,6 +377,8 @@ def _live_view(
     returns: dict[str, Any],
     done: set[str],
     missing: set[str],
+    quiet: set[str],
+    offline: set[str],
     spinner: Spinner,
     *,
     n_cells: int,
@@ -348,20 +386,34 @@ def _live_view(
 ) -> Group:
     """A live checklist: a tick for finished minions (with ``cells_for`` of
     their reply in aligned columns), a spinner for the ones still running, an x
-    for those that never reported, under a one-line status header. ``missing``
-    is only populated in the final frame (after the deadline or a Ctrl+C); while
-    polling it's empty, so still-pending minions show a spinner. ``n_cells`` is
-    how many trailing columns ``cells_for`` produces (so blank rows stay
-    aligned)."""
+    for those that never reported, under a one-line status header. ``quiet``
+    is the targeted minions that have ignored several liveness pings (a ? with
+    a ``silent`` tag — might yet be a reconnecting NAT drop); after enough
+    unbroken silence they harden into ``offline`` (an x with an ``offline``
+    tag). Both sets stay inside the outstanding minions — a returned minion is
+    neither. ``missing`` is only populated in the final frame (after the
+    deadline or a Ctrl+C); while polling it's empty, so still-pending minions
+    show a spinner. ``n_cells`` is how many trailing columns ``cells_for``
+    produces (so blank rows stay aligned)."""
     blanks = [Text("")] * n_cells
+    quiet_cells = [Text("silent", style="yellow"), *[Text("")] * (n_cells - 1)]
+    offline_cells = [Text("offline", style="red"), *[Text("")] * (n_cells - 1)]
     grid = Table.grid(padding=(0, 1))
     grid.add_column(no_wrap=True)  # marker
     grid.add_column(no_wrap=True)  # minion id
     for _ in range(n_cells):  # per-command trailing columns
         grid.add_column(no_wrap=True, justify="left")
     for minion in targeted:
-        if minion in missing:
+        if minion in offline:
+            grid.add_row(
+                Text("X", style="red"), Text(minion, style="dim"), *offline_cells
+            )
+        elif minion in missing:
             grid.add_row(Text("X", style="red"), Text(minion, style="dim"), *blanks)
+        elif minion in quiet:
+            grid.add_row(
+                Text("?", style="yellow"), Text(minion, style="dim"), *quiet_cells
+            )
         elif minion in done:
             grid.add_row(
                 Text("+", style="green"), Text(minion), *cells_for(returns.get(minion))
@@ -369,12 +421,18 @@ def _live_view(
         else:
             grid.add_row(spinner, Text(minion, style="dim"), *blanks)
 
-    pending = len(targeted) - len(done) - len(missing)
+    n_missing = len(missing - offline)
+    n_quiet = len(quiet - missing - offline)
+    pending = len(targeted) - len(done) - n_missing - n_quiet - len(offline)
     bits = [f"{len(done)}/{len(targeted)} done"]
     if pending:
         bits.append(f"{pending} running")
-    if missing:
-        bits.append(f"[red]{len(missing)} no response[/]")
+    if n_quiet:
+        bits.append(f"[yellow]{n_quiet} silent[/]")
+    if offline:
+        bits.append(f"[red]{len(offline)} offline[/]")
+    if n_missing:
+        bits.append(f"[red]{n_missing} no response[/]")
     header = Text.from_markup(f"[dim]{'  '.join(bits)}[/]")
     return Group(header, grid)
 
@@ -385,19 +443,27 @@ def _stream_job(
     *,
     n_cells: int,
     cells_for: Callable[[Any], list[Text]],
-) -> tuple[dict[str, Any], set[str], float, bool] | None:
+) -> tuple[dict[str, Any], set[str], set[str], float, bool] | None:
     """Fire a job async, show a live checklist, and return its raw results.
 
-    Submits ``payload`` via the ``local_async`` client (returns a job id at
-    once), then polls ``runner jobs.lookup_jid`` until every targeted minion
-    has returned, the deadline trips, or the user hits Ctrl+C. While polling it
-    shows a live per-minion checklist (spinner -> tick), whose trailing columns
-    come from ``cells_for(value)`` (``n_cells`` of them). In every case it then
-    renders the final checklist frame and returns ``(returns, outstanding,
-    start, interrupted)`` — ``outstanding`` being the targeted minions that
-    never reported — for the caller to render, or ``None`` if no job started
-    (already reported). ``call(name, **kw)`` invokes the named salt-api
-    client."""
+    Submits a liveness ping then ``payload`` via the ``local_async`` client
+    (returns a job id at once), then polls ``runner jobs.lookup_jid`` until
+    every targeted minion has returned, everyone still outstanding is presumed
+    offline (ignored the job plus _OFFLINE_PINGS liveness pings, for at least
+    _OFFLINE_AFTER), the deadline trips, or the user hits Ctrl+C. Silent
+    minions are re-pinged every _PING_INTERVAL, and one that ignores several
+    pings then answers a later one just reconnected after missing the publish
+    — the job is re-sent to it (see the comment above _POLL_INTERVAL). While
+    polling it shows a live per-minion checklist (spinner -> tick, silent and
+    offline minions tagged), whose trailing
+    columns come from ``cells_for(value)`` (``n_cells`` of them). In
+    every case it then renders the final checklist frame and returns
+    ``(returns, outstanding, offline, start, interrupted)`` — ``outstanding``
+    being the targeted minions that never reported and ``offline`` the subset
+    of those presumed unreachable — for the caller to render, or ``None`` if
+    no job started (already reported). ``call(name, **kw)`` invokes the named
+    salt-api client."""
+    ping_jid = _submit_async(call, tgt=payload["tgt"], fun="test.ping")
     submit = call("local_async", **payload)
     info: Any = _first_return(submit)
     jid = info.get("jid")
@@ -421,6 +487,8 @@ def _stream_job(
     console.print(f"[dim]job {jid} -> {len(targeted)} minion(s)[/]")
     start = time.monotonic()
     returns: dict[str, Any] = {}
+    quiet: set[str] = set()
+    offline: set[str] = set()
     spinner = Spinner("dots", style="cyan")
 
     def view(missing: set[str] | None = None) -> Group:
@@ -430,30 +498,109 @@ def _stream_job(
             returns,
             done,
             missing or set(),
+            quiet,
+            offline,
             spinner,
             n_cells=n_cells,
             cells_for=cells_for,
         )
 
-    # Poll lookup_jid until everyone's back or the deadline trips; Ctrl+C stops
-    # waiting early. The job keeps running on the minions either way — we just
-    # stop watching and render whatever was gathered. transient=False keeps the
-    # finished checklist on screen above the rendered tables.
+    # Poll lookup_jid until everyone's back, everyone left is offline, or the
+    # deadline trips; Ctrl+C stops waiting early. The job keeps running on the
+    # minions either way — we just stop watching and render whatever was
+    # gathered. transient=False keeps the finished checklist on screen above
+    # the rendered tables.
     interrupted = False
+    jids = [jid]  # the job, plus any re-sends to reconnected minions
+    alive: set[str] = set()  # answered some liveness ping
+    resent: dict[str, int] = {}  # minion -> times the job was re-sent to it
+    reset_at: dict[str, float] = {}  # ignore pings before this (post re-send)
+    # Each ping round: its jid, publish time, and who it targeted. Round 0 is
+    # the pre-job ping at the original target expression.
+    rounds: list[tuple[str, float, set[str]]] = []
+    if ping_jid:
+        rounds.append((ping_jid, start, expected))
     with Live(console=console, refresh_per_second=12, transient=False) as live:
         try:
             while True:
                 # lookup_jid is cumulative: each poll returns every minion that
-                # has reported so far, so we just keep the latest snapshot.
-                returns = _lookup_returns(
-                    _first_return(
-                        call("runner", fun="jobs.lookup_jid", kwarg={"jid": jid})
+                # has reported so far; merge the snapshots across all jids.
+                for j in jids:
+                    returns.update(
+                        _lookup_returns(
+                            _first_return(
+                                call("runner", fun="jobs.lookup_jid", kwarg={"jid": j})
+                            )
+                        )
                     )
-                )
+                outstanding = expected - set(returns)
+                now = time.monotonic()
+                # Collect liveness answers from the newest ping rounds (late
+                # answers count; a reconnected minion only ever receives the
+                # newest, so polling further back buys nothing).
+                for rjid, _, targets in rounds[-2:]:
+                    if targets - alive - set(returns):
+                        answers = _lookup_returns(
+                            _first_return(
+                                call(
+                                    "runner",
+                                    fun="jobs.lookup_jid",
+                                    kwarg={"jid": rjid},
+                                )
+                            )
+                        )
+                        alive |= expected & set(answers)
+                # The reconnect signature: tagged silent (ignored several
+                # pings and the job — the publish never reached it), now
+                # answering. Re-send the job to it and make it re-prove
+                # liveness from scratch, so a second drop re-runs this cycle.
+                recovered = {m for m in quiet & alive if resent.get(m, 0) < _MAX_RESEND}
+                if recovered:
+                    rejid = _submit_async(
+                        call,
+                        **{**payload, "tgt": sorted(recovered), "tgt_type": "list"},
+                    )
+                    if rejid:
+                        jids.append(rejid)
+                        for m in recovered:
+                            resent[m] = resent.get(m, 0) + 1
+                            reset_at[m] = now
+                        alive -= recovered
+                # Silent: missed _OFFLINE_PINGS pings (each old enough that an
+                # answer would have arrived) plus the job. Offline: silent for
+                # _OFFLINE_AFTER straight — long enough to have reconnected
+                # and answered a fresh ping, were it a NAT-dropped connection.
+                quiet = {
+                    m
+                    for m in outstanding - alive
+                    if sum(
+                        1
+                        for _, t, targets in rounds
+                        if m in targets
+                        and t >= reset_at.get(m, -1.0)
+                        and now - t >= _PING_GRACE
+                    )
+                    >= _OFFLINE_PINGS
+                }
+                offline = {
+                    m for m in quiet if now - reset_at.get(m, start) >= _OFFLINE_AFTER
+                }
+                # Re-ping whoever is still silent, so slow answers, reconnects,
+                # and genuinely-down minions keep accumulating evidence.
+                silent = outstanding - alive
+                last_round = rounds[-1][1] if rounds else start
+                if silent and now - last_round >= _PING_INTERVAL:
+                    rjid = _submit_async(
+                        call, tgt=sorted(silent), tgt_type="list", fun="test.ping"
+                    )
+                    if rjid:
+                        rounds.append((rjid, now, set(silent)))
                 live.update(view())
-                if not expected - set(returns):
+                if not outstanding:
                     break
-                if time.monotonic() - start > _POLL_DEADLINE:
+                if offline == outstanding:
+                    break
+                if now - start > _POLL_DEADLINE:
                     break
                 time.sleep(_POLL_INTERVAL)
         except KeyboardInterrupt:
@@ -461,23 +608,42 @@ def _stream_job(
         # Final frame: mark whoever never reported so the persisted checklist
         # reflects the true end state rather than a frozen spinner.
         outstanding = expected - set(returns)
+        offline &= outstanding
         live.update(view(outstanding))
 
-    return returns, expected - set(returns), start, interrupted
+    if resent:
+        names = ", ".join(sorted(resent, key=_natural_key))
+        console.print(
+            f"[dim]re-sent the job to {names} - reconnected after missing the "
+            f"original publish[/]"
+        )
+    return returns, expected - set(returns), offline, start, interrupted
 
 
-def _print_outstanding(outstanding: set[str], interrupted: bool) -> None:
+def _print_outstanding(
+    outstanding: set[str], offline: set[str], interrupted: bool
+) -> None:
     """Trailer naming the minions that hadn't reported when we stopped waiting
-    — because the user interrupted, or the deadline tripped."""
+    — because the user interrupted, everyone left was offline, or the deadline
+    tripped."""
     if not outstanding:
         return
-    names = ", ".join(sorted(outstanding, key=_natural_key))
     if interrupted:
+        names = ", ".join(sorted(outstanding, key=_natural_key))
         console.print(
             f"[yellow]stopped waiting (Ctrl+C); no result yet from: {names} "
             f"- the job may still be running on them[/]"
         )
-    else:
+        return
+    if offline:
+        names = ", ".join(sorted(offline, key=_natural_key))
+        console.print(
+            f"[yellow]no result from: {names} - ignored the job and repeated "
+            f"liveness pings, so presumed offline; the job never reached them[/]"
+        )
+    waiting = outstanding - offline
+    if waiting:
+        names = ", ".join(sorted(waiting, key=_natural_key))
         console.print(
             f"[yellow]no result from: {names} within the "
             f"{int(_POLL_DEADLINE)}s deadline (still running, or down)[/]"
@@ -490,11 +656,11 @@ def _stream_state(call: Callable[..., dict[str, Any]], payload: dict[str, Any]) 
     result = _stream_job(call, payload, n_cells=5, cells_for=_state_cells)
     if result is None:
         return
-    returns, outstanding, start, interrupted = result
+    returns, outstanding, offline, start, interrupted = result
 
     # Live view cleared — render the coloured tables, one block per minion.
     _print_state_result({"return": [returns]})
-    _print_outstanding(outstanding, interrupted)
+    _print_outstanding(outstanding, offline, interrupted)
 
     # Fleet-wide summary: totals across all minions + wall-clock elapsed.
     totals, n = _grand_totals(returns)
@@ -654,10 +820,10 @@ def _stream_cmd(call: Callable[..., dict[str, Any]], payload: dict[str, Any]) ->
     result = _stream_job(call, payload, n_cells=1, cells_for=_cmd_cells)
     if result is None:
         return
-    returns, outstanding, start, interrupted = result
+    returns, outstanding, offline, start, interrupted = result
 
     _print_cmd_result({"return": [returns]})
-    _print_outstanding(outstanding, interrupted)
+    _print_outstanding(outstanding, offline, interrupted)
 
     n = len(returns)
     if n:

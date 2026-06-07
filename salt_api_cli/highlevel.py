@@ -177,8 +177,23 @@ def _print_state_return(minion: str, states: dict[str, Any]) -> None:
         if status == "ok":
             detail: str | Text = ""
         elif status == "change":
-            changed = ", ".join(state.get("changes", {})) or "(changes)"
-            detail = f"changed: {_short(changed)}"
+            changes = state.get("changes", {})
+            if "stdout" in changes:
+                # cmd.run-style changes: show the command's output itself
+                # rather than the fixed pid/retcode/stdout/stderr key list.
+                out = (
+                    str(changes.get("stdout") or "").strip()
+                    or str(changes.get("stderr") or "").strip()
+                )
+                # Full output, folded across lines, so nothing is cut off.
+                detail = (
+                    Text(out, no_wrap=False, overflow="fold")
+                    if out
+                    else "changed: (no output)"
+                )
+            else:
+                changed = ", ".join(changes) or "(changes)"
+                detail = f"changed: {_short(changed)}"
         elif status == "fail":
             detail = Text(_short(state.get("comment", ""), 240), style="red")
         else:  # diff / skip
@@ -193,7 +208,12 @@ def _print_state_return(minion: str, states: dict[str, Any]) -> None:
     fn_w = max((len(fn) for _, fn, _, _ in rows), default=8)
     ref_w = max((len(ref) for _, _, ref, _ in rows), default=8)
     nat_w = max(
-        (len(d.plain if isinstance(d, Text) else d) for _, _, _, d in rows), default=0
+        (
+            len(line)
+            for _, _, _, d in rows
+            for line in (d.plain if isinstance(d, Text) else d).splitlines()
+        ),
+        default=0,
     )
     detail_w = min(nat_w, max(20, console.width - 2 - 1 - fn_w - ref_w - 3 * 2))
 
@@ -242,7 +262,7 @@ def _print_state_result(result: dict[str, Any]) -> None:
     if not ret:
         console.print("(no minions responded)")
         return
-    for minion in sorted(ret):
+    for minion in sorted(ret, key=_natural_key):
         _print_one_minion(minion, ret[minion])
 
 

@@ -741,11 +741,23 @@ def run_keys(args: argparse.Namespace, call: Callable[..., dict[str, Any]]) -> N
         "delete": "key.delete",
     }
     match: str = "*" if action == "accept-all" else args.match
+
+    # salt's key.delete returns an empty payload on success: it evaluates the
+    # name match *after* removing the key files, so nothing matches and the
+    # `return` comes back `{}` even when keys were deleted (accept/reject don't
+    # hit this — their keys still exist when the return is built). Resolve the
+    # affected ids up front so we can report what was actually deleted instead
+    # of misprinting "(no keys changed)".
+    pre_match: dict[str, list[str]] = {}
+    if action == "delete":
+        nm = call(fun="key.name_match", match=match)
+        pre_match = nm["return"][0]["data"].get("return", {}) or {}
+
     result = call(fun=fun_map[action], match=match)
     data = result["return"][0]["data"]
     if not data.get("success"):
         sys.exit(f"failed: {data}")
-    changed: dict[str, list[str]] = data.get("return", {})
+    changed: dict[str, list[str]] = data.get("return", {}) or pre_match
     if not changed:
         console.print("(no keys changed)")
         return

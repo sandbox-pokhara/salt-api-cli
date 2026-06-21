@@ -100,10 +100,13 @@ def _state_function(key: str) -> str:
     return parts[0]
 
 
-def _short(text: str, limit: int = 100) -> str:
-    """Collapse whitespace and truncate a comment to one tidy line."""
-    flat = " ".join(str(text).split())
-    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+def _oneline(text: str) -> str:
+    """Collapse all whitespace runs to single spaces, on one line.
+
+    Used for compact details (e.g. the list of changed keys) where the
+    structure doesn't matter. Nothing is truncated — long values are folded
+    across lines by the table's detail column, never cut off."""
+    return " ".join(str(text).split())
 
 
 def _fmt_duration(ms: float) -> str:
@@ -185,26 +188,23 @@ def _print_state_return(minion: str, states: dict[str, Any]) -> None:
                     str(changes.get("stdout") or "").strip()
                     or str(changes.get("stderr") or "").strip()
                 )
-                # Full output, folded across lines, so nothing is cut off.
-                detail = (
-                    Text(out, no_wrap=False, overflow="fold")
-                    if out
-                    else "changed: (no output)"
-                )
+                detail = Text(out) if out else "changed: (no output)"
             else:
                 changed = ", ".join(changes) or "(changes)"
-                detail = f"changed: {_short(changed)}"
+                detail = f"changed: {_oneline(changed)}"
         elif status == "fail":
-            detail = Text(_short(state.get("comment", ""), 240), style="red")
+            detail = Text(str(state.get("comment", "")).strip(), style="red")
         else:  # diff / skip
-            detail = _short(state.get("comment", ""))
+            detail = Text(str(state.get("comment", "")).strip())
         rows.append((Text(marker, style=style), _state_function(key), ref, detail))
 
-    # Pin the detail column to whatever width is left so rich shrinks *it*
-    # (ellipsis) rather than collapsing the short marker/function/ref columns
-    # to nothing on a narrow terminal. Width budget: 2-space left Padding +
-    # 1-char marker + the natural function/ref widths + three 2-space column
-    # gaps (pad_edge=False). Floor at 20 so detail never vanishes outright.
+    # Pin the detail column to whatever width is left so rich folds *it*
+    # (wraps onto extra lines) rather than collapsing the short
+    # marker/function/ref columns to nothing on a narrow terminal. Full
+    # content is always shown — long details just span more rows. Width
+    # budget: 2-space left Padding + 1-char marker + the natural function/ref
+    # widths + three 2-space column gaps (pad_edge=False). Floor at 20 so
+    # detail never gets squeezed to a sliver.
     fn_w = max((len(fn) for _, fn, _, _ in rows), default=8)
     ref_w = max((len(ref) for _, _, ref, _ in rows), default=8)
     nat_w = max(
@@ -221,7 +221,7 @@ def _print_state_return(minion: str, states: dict[str, Any]) -> None:
     table.add_column("marker", no_wrap=True)
     table.add_column("function", style="cyan", no_wrap=True)
     table.add_column("ref", style="dim", no_wrap=True)
-    table.add_column("detail", no_wrap=True, overflow="ellipsis", width=detail_w)
+    table.add_column("detail", overflow="fold", width=detail_w)
 
     for row in rows:
         table.add_row(*row)
